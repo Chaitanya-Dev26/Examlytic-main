@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react"
+import { useCallback, useEffect, useMemo, useState, useRef } from "react"
 import { useNavigate, useParams } from "react-router-dom"
 import supabase from "../SupabaseClient"
 import Loader from "../Components/common/Loader"
@@ -13,6 +13,8 @@ import { jsPDF } from "jspdf"
 import "../AdminDashboard.css"
 import { generateExamQuestions } from "../utils/groqService"
 import LiveMonitoring from "../Components/LiveMonitoring"
+import { useExamActivity } from "../context/ExamActivityProvider"
+import { serializeExamConfig } from "../utils/examConfig"
 
 // Modal component for viewing/editing questions
 const QuestionModal = ({ exam, onClose, onSave }) => {
@@ -197,6 +199,14 @@ export default function AdminDashboard() {
   const { examId } = useParams();
   const navigate = useNavigate();
 
+  // Issue #4 — ONE shared admin Realtime activity channel, provided by
+  // ExamActivityProvider (never one channel per student/attempt/row).
+  const { events: liveActivityEvents, connectionStatus } = useExamActivity();
+  const liveActivityRef = useRef([]);
+  liveActivityRef.current = liveActivityEvents;
+  const countedActivityKeysRef = useRef(new Set());
+  const countersBaselineReadyRef = useRef(false);
+
   const handleLogout = async () => {
     try {
       const { error } = await supabase.auth.signOut();
@@ -354,7 +364,7 @@ FACE_NOT_FOUND: 0,
         enable_calculator: createExamEnableCalculator,
         total_marks: createExamTotalMarks
       };
-      const instructionsWithConfig = `${createExamInstructions}\n\n---CONFIG---\n${JSON.stringify(config)}`;
+      const instructionsWithConfig = serializeExamConfig(createExamInstructions, config);
 
       const { error } = await supabase.from("exams").insert([
         {
@@ -619,24 +629,28 @@ FACE_NOT_FOUND: 0,
       const active = attemptsWithUser.filter(a => a.submitted_at === null);
       const completed = attemptsWithUser.filter(a => a.submitted_at !== null);
 
-      // 5. Fetch recent logs for active attempts from exam_flags
+      // 5. Fetch flags only for currently ACTIVE exams (bounded query, never
+      //    the whole exam_flags table).
       let activeWithLogs = active.map(a => ({ ...a, flagsCount: 0, latestFlag: null }));
-      const { data: activeFlags, error: activeFlagsError } = await supabase
-        .from('exam_flags')
-        .select('*')
-        .order('timestamp', { ascending: false });
-
-      if (!activeFlagsError && activeFlags) {
-        activeWithLogs = active.map(a => {
-          const studentFlags = activeFlags.filter(flag => flag.exam_id === a.exam_id && flag.user_id === a.student_id);
-          return {
-            ...a,
-            flagsCount: studentFlags.length,
-            latestFlag: studentFlags[0] || null,
-            flags: studentFlags
-          };
-        });
+      const activeExamIds = [...new Set(active.map(a => a.exam_id).filter(Boolean))];
+      let activeFlags = [];
+      if (activeExamIds.length) {
+        const { data: activeFlagsData, error: activeFlagsError } = await supabase
+          .from('exam_flags')
+          .select('*')
+          .in('exam_id', activeExamIds)
+          .order('timestamp', { ascending: false });
+        if (!activeFlagsError && activeFlagsData) activeFlags = activeFlagsData;
       }
+      activeWithLogs = active.map(a => {
+        const studentFlags = activeFlags.filter(flag => flag.exam_id === a.exam_id && flag.user_id === a.student_id);
+        return {
+          ...a,
+          flagsCount: studentFlags.length,
+          latestFlag: studentFlags[0] || null,
+          flags: studentFlags
+        };
+      });
       setActiveAttempts(activeWithLogs);
 
       // Fetch recent flags globally for real-time Warning Log table
@@ -658,18 +672,22 @@ FACE_NOT_FOUND: 0,
         setRecentFlags(flagsWithUser);
       }
 
-      // Fetch all flags & logs for aggregate analytics calculations
-      const { data: allFlags, error: allFlagsErr } = await supabase
-        .from('exam_flags')
-        .select('*');
-
-      const { data: allLogs } = await supabase
+      // Aggregate analytics via HEAD count + a single narrow column — never
+      // download the full exam_logs/exam_flags history on every poll.
+      const { count: tabSwapCount, error: tabSwapErr } = await supabase
         .from('exam_logs')
-        .select('event_type');
+        .select('*', { count: 'exact', head: true })
+        .eq('event_type', 'TAB_SWITCH');
 
-      if (!allFlagsErr && allFlags) {
-        const tabSwaps = (allLogs || []).filter(l => l.event_type === 'TAB_SWITCH').length;
-        setTotalFlagsCount(allFlags.length + tabSwaps);
+      const { data: flagTypeRows, error: flagTypeErr } = await supabase
+        .from('exam_flags')
+        .select('flag_type');
+
+      const tabSwaps = tabSwapErr ? 0 : (tabSwapCount || 0);
+      const flagRows = flagTypeErr || !flagTypeRows ? [] : flagTypeRows;
+
+      {
+        setTotalFlagsCount(flagRows.length + tabSwaps);
 
         const breakdown = {
           TAB_SWITCH: tabSwaps,
@@ -679,7 +697,7 @@ FACE_NOT_FOUND: 0,
           COCO_SSD_OBJECT: 0
         };
 
-        allFlags.forEach(f => {
+        flagRows.forEach(f => {
           const key = f.flag_type;
           if (breakdown[key] !== undefined) {
             breakdown[key]++;
@@ -689,10 +707,20 @@ FACE_NOT_FOUND: 0,
         });
         setFlagBreakdown(breakdown);
 
-        const totalSusEvents = allFlags.length + tabSwaps;
+        const totalSusEvents = flagRows.length + tabSwaps;
         const score = Math.max(60, 100 - (totalSusEvents * 1.5)).toFixed(1);
         setIntegrityScore(`${score}%`);
       }
+
+      // Counters now mirror the database. Mark the realtime-delivered events
+      // currently buffered as "already counted" so future live events increment
+      // the counters without double counting.
+      countedActivityKeysRef.current = new Set(
+        (liveActivityRef.current || [])
+          .filter(ev => ev && ev.deliveredBy === 'realtime')
+          .map(ev => ev.dedupeKey)
+      );
+      countersBaselineReadyRef.current = true;
 
       // 6. Compute stats
       const totalCompleted = completed.length;
@@ -730,9 +758,14 @@ FACE_NOT_FOUND: 0,
     }
   };
 
+  // Realtime drives instant updates. Polling is only a low-frequency
+  // reconciliation fallback (and the ref fixes the stale-closure interval).
+  const loadDashboardDataRef = useRef(loadDashboardData);
+  loadDashboardDataRef.current = loadDashboardData;
+
   useEffect(() => {
-    loadDashboardData();
-    const interval = setInterval(loadDashboardData, 10000);
+    loadDashboardDataRef.current();
+    const interval = setInterval(() => loadDashboardDataRef.current(), 60000);
     return () => clearInterval(interval);
   }, []);
 
@@ -766,7 +799,7 @@ FACE_NOT_FOUND: 0,
         .from('exam_logs')
         .select('*')
         .eq('exam_attempt_id', selectedAttempt.id)
-        .order('timestamp', { ascending: true });
+        .order('created_at', { ascending: true });
         
       // Fetch flags
       const { data: flagsData, error: flagsError } = await supabase
@@ -876,20 +909,108 @@ FACE_NOT_FOUND: 0,
   );
 
   const filteredStudents = users.filter(user => {
-    const query = searchQuery || studentSearchQuery;
-    return user.email.toLowerCase().includes(query.toLowerCase()) ||
-      (user.user_name && user.user_name.toLowerCase().includes(query.toLowerCase()));
+    const query = String(searchQuery || studentSearchQuery || '').toLowerCase();
+    return String(user.email || '').toLowerCase().includes(query) ||
+      String(user.user_name || '').toLowerCase().includes(query);
   });
 
-  const filteredActiveAttempts = activeAttempts.filter(attempt => 
-    attempt.user_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    attempt.user_email.toLowerCase().includes(searchQuery.toLowerCase())
+  const filteredActiveAttempts = activeAttempts.filter(attempt =>
+    String(attempt.user_name || '').toLowerCase().includes(String(searchQuery || '').toLowerCase()) ||
+    String(attempt.user_email || '').toLowerCase().includes(String(searchQuery || '').toLowerCase())
   );
 
-  const filteredRecentFlags = recentFlags.filter(flag => 
-    flag.user_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    (flag.flag_type && flag.flag_type.toLowerCase().includes(searchQuery.toLowerCase()))
-  );
+  // ----- Issue #4: live activity integration (hooks run before any return) -----
+
+  const resolveActivityUserName = useCallback((ev) => {
+    if (!ev) return 'Unknown Student';
+    if (ev.user_name) return ev.user_name;
+    const uid = ev.user_id ?? ev.studentId ?? ev.student_id;
+    const u = (users || []).find(x => x.id === uid);
+    return u?.user_name || u?.email?.split('@')[0] || 'Unknown Student';
+  }, [users]);
+
+  // Increment live counters for realtime-delivered events only. Resynced events
+  // are already covered by the DB baseline. Only events that the baseline also
+  // counts (exam_flags rows + TAB_SWITCH logs) are counted here, so the totals
+  // stay consistent with the initial aggregate query.
+  useEffect(() => {
+    const incoming = liveActivityEvents || [];
+    if (!incoming.length) return;
+    const isCountable = (ev) =>
+      ev.source === 'exam_flags' || ev.eventType === 'TAB_SWITCH' || ev.flag_type === 'TAB_SWITCH';
+    const toApply = [];
+    for (const ev of incoming) {
+      if (!ev || !ev.dedupeKey) continue;
+      if (ev.deliveredBy !== 'realtime') continue;
+      if (countedActivityKeysRef.current.has(ev.dedupeKey)) continue;
+      countedActivityKeysRef.current.add(ev.dedupeKey);
+      if (countersBaselineReadyRef.current && isCountable(ev)) toApply.push(ev);
+    }
+    if (!toApply.length) return;
+    setTotalFlagsCount(c => c + toApply.length);
+    setFlagBreakdown(prev => {
+      const next = { ...prev };
+      for (const ev of toApply) {
+        const key = ev.flag_type || ev.eventType || 'OTHER';
+        next[key] = (next[key] || 0) + 1;
+      }
+      return next;
+    });
+  }, [liveActivityEvents]);
+
+  // Global live feed = DB snapshot + live events, deduped by source:id.
+  const mergedRecentFlags = useMemo(() => {
+    const keyOf = (row) => row.dedupeKey || `${row.source || 'exam_flags'}:${row.id}`;
+    const asFeedRow = (ev) => ({
+      ...ev,
+      user_name: resolveActivityUserName(ev),
+      user_email: '',
+      exam_id: ev.exam_id ?? ev.examId ?? null,
+      user_id: ev.user_id ?? ev.studentId ?? ev.student_id ?? null,
+      flag_type: ev.flag_type || ev.eventType || 'ACTIVITY',
+      timestamp: ev.timestamp || ev.createdAt,
+      created_at: ev.created_at || ev.createdAt,
+    });
+    const map = new Map();
+    [...(recentFlags || []), ...(liveActivityEvents || []).map(asFeedRow)].forEach(row => {
+      if (!row) return;
+      const k = keyOf(row);
+      if (!map.has(k)) map.set(k, row);
+    });
+    return [...map.values()].sort(
+      (a, b) => new Date(b.timestamp || b.created_at || 0) - new Date(a.timestamp || a.created_at || 0)
+    );
+  }, [recentFlags, liveActivityEvents, resolveActivityUserName]);
+
+  const filteredRecentFlags = mergedRecentFlags.filter(flag => {
+    const q = String(searchQuery || '').toLowerCase();
+    return String(flag.user_name || '').toLowerCase().includes(q) ||
+      String(flag.flag_type || '').toLowerCase().includes(q);
+  });
+
+  // Live timeline for the selected attempt (updates without re-selecting it).
+  const matchesSelectedAttempt = useCallback((ev, attempt) => {
+    if (!ev || !attempt) return false;
+    const attemptId = ev.exam_attempt_id ?? ev.examAttemptId ?? null;
+    if (attemptId) return String(attemptId) === String(attempt.id);
+    const evExamId = ev.exam_id ?? ev.examId ?? null;
+    const evStudentId = ev.user_id ?? ev.student_id ?? ev.studentId ?? null;
+    return String(evStudentId) === String(attempt.student_id) &&
+      String(evExamId) === String(attempt.exam_id);
+  }, []);
+
+  const displayedSelectedAttemptLogs = useMemo(() => {
+    if (!selectedAttempt) return selectedAttemptLogs || [];
+    const keyOf = (row) => row.dedupeKey || `${row.source || (row.isFlag ? 'exam_flags' : 'exam_logs')}:${row.id}`;
+    const map = new Map();
+    (selectedAttemptLogs || []).forEach(row => { if (row) map.set(keyOf(row), row); });
+    (liveActivityEvents || []).forEach(ev => {
+      if (matchesSelectedAttempt(ev, selectedAttempt)) map.set(keyOf(ev), ev);
+    });
+    return [...map.values()].sort(
+      (a, b) => new Date(a.timestamp || a.created_at || 0) - new Date(b.timestamp || b.created_at || 0)
+    );
+  }, [selectedAttemptLogs, liveActivityEvents, selectedAttempt, matchesSelectedAttempt]);
 
   if (initialLoad) {
     return <Loader fullPage message="Loading Admin Panel..." />;
@@ -956,8 +1077,14 @@ FACE_NOT_FOUND: 0,
             <span style={{ fontSize: '1.2rem', fontWeight: '800', color: '#111827' }}>
               {selectedUser ? "Students" : activeTab.charAt(0).toUpperCase() + activeTab.slice(1)}
             </span>
-            <div className="live-session-badge">
-              Live Session Active
+            <div className="live-session-badge" title={`Realtime channel: ${connectionStatus}`}>
+              <span style={{
+                display: 'inline-block', width: 8, height: 8, borderRadius: '50%', marginRight: 6,
+                backgroundColor: connectionStatus === 'SUBSCRIBED' ? '#10B981'
+                  : connectionStatus === 'DISABLED' ? '#9CA3AF' : '#F59E0B'
+              }} />
+              {connectionStatus === 'SUBSCRIBED' ? 'Live'
+                : connectionStatus === 'DISABLED' ? 'Offline' : 'Reconnecting…'}
             </div>
           </div>
 
@@ -1170,7 +1297,7 @@ FACE_NOT_FOUND: 0,
                             <tr key={flag.id}>
                               <td>{new Date(flag.timestamp || flag.created_at).toLocaleTimeString()}</td>
                               <td>{flag.user_name}</td>
-                              <td>{flag.flag_type.replace(/_/g, ' ')}</td>
+                              <td>{String(flag.flag_type || '').replace(/_/g, ' ')}</td>
                               <td>
                                 <span className={`severity-pill pill-${severity}`}>
                                   {severity}
@@ -1504,17 +1631,17 @@ FACE_NOT_FOUND: 0,
 
                     {/* Progress indicators grid */}
                     {(() => {
-                      const faceAlerts = selectedAttemptLogs.filter(l => l.isFlag && ['NO_FACE_DETECTED', 'MULTIPLE_FACES_DETECTED'].includes(l.type)).length;
+                      const faceAlerts = displayedSelectedAttemptLogs.filter(l => l.isFlag && ['NO_FACE_DETECTED', 'MULTIPLE_FACES_DETECTED'].includes(l.type)).length;
                       const faceStatus = faceAlerts === 0 ? '100% Match' : `${faceAlerts} Alert${faceAlerts > 1 ? 's' : ''}`;
                       const faceWidth = faceAlerts === 0 ? '100%' : `${Math.max(10, 100 - (faceAlerts * 15))}%`;
                       const faceColor = faceAlerts === 0 ? '#10B981' : '#DC2626';
 
-                      const tabSwaps = selectedAttemptLogs.filter(l => l.type === 'TAB_SWITCH').length;
+                      const tabSwaps = displayedSelectedAttemptLogs.filter(l => l.type === 'TAB_SWITCH').length;
                       const tabStatus = tabSwaps === 0 ? '0 Detected' : `${tabSwaps} Swapped`;
                       const tabWidth = tabSwaps === 0 ? '100%' : `${Math.max(10, 100 - (tabSwaps * 25))}%`;
                       const tabColor = tabSwaps === 0 ? '#10B981' : '#F59E0B';
 
-                      const lookAlerts = selectedAttemptLogs.filter(l => l.isFlag && l.type === 'LOOKING_AWAY').length;
+                      const lookAlerts = displayedSelectedAttemptLogs.filter(l => l.isFlag && l.type === 'LOOKING_AWAY').length;
                       const lookStatus = lookAlerts === 0 ? 'Stable' : `${lookAlerts} Alert${lookAlerts > 1 ? 's' : ''}`;
                       const lookWidth = lookAlerts === 0 ? '100%' : `${Math.max(10, 100 - (lookAlerts * 15))}%`;
                       const lookColor = lookAlerts === 0 ? '#10B981' : '#F59E0B';
@@ -1560,11 +1687,11 @@ FACE_NOT_FOUND: 0,
                     <h3 style={{ margin: '0 0 16px 0', fontSize: '1rem', fontWeight: 800, color: '#111827', display: 'flex', alignItems: 'center', gap: '8px' }}>
                       <FaHistory style={{ color: '#2b7cff' }} /> Anomaly Timeline & Log Feed
                     </h3>
-                    {selectedAttemptLogs.length === 0 ? (
+                    {displayedSelectedAttemptLogs.length === 0 ? (
                       <p style={{ margin: 0, fontSize: '0.85rem', color: '#6B7280', textAlign: 'center', padding: '12px 0' }}>No anomaly events logged for this session.</p>
                     ) : (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '220px', overflowY: 'auto', paddingRight: '8px' }}>
-                        {selectedAttemptLogs.map((log, i) => {
+                        {displayedSelectedAttemptLogs.map((log, i) => {
                           const logTime = new Date(log.timestamp || log.created_at).toLocaleTimeString();
                           const isAnomaly = log.isFlag || ['TAB_SWITCH', 'FACE_NOT_FOUND', 'MULTIPLE_FACES', 'COCO_SSD_OBJECT'].includes(log.type);
                           const tagColor = isAnomaly ? '#DC2626' : '#059669';
@@ -1574,7 +1701,7 @@ FACE_NOT_FOUND: 0,
                             <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start', padding: '10px 12px', borderRadius: '8px', backgroundColor: bgColor, borderLeft: `4px solid ${tagColor}` }}>
                               <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#6B7280', whiteSpace: 'nowrap' }}>{logTime}</span>
                               <div style={{ flex: 1 }}>
-                                <span style={{ fontSize: '0.8rem', fontWeight: 800, color: '#1F2937', display: 'block' }}>{log.type.replace(/_/g, ' ')}</span>
+                                <span style={{ fontSize: '0.8rem', fontWeight: 800, color: '#1F2937', display: 'block' }}>{String(log.type || '').replace(/_/g, ' ')}</span>
                                 <span style={{ fontSize: '0.75rem', color: '#4B5563' }}>{log.message || 'Status verified secure'}</span>
                               </div>
                             </div>
@@ -1805,11 +1932,11 @@ FACE_NOT_FOUND: 0,
                           const isHigh = ['MULTIPLE_FACES_DETECTED', 'NO_FACE_DETECTED'].includes(flag.flag_type);
                           return (
                             <tr key={idx} style={{ borderBottom: '1px solid #F1F5F9' }}>
-                              <td style={{ padding: '12px', color: '#6B7280' }}>{new Date(flag.timestamp).toLocaleTimeString()}</td>
+                              <td style={{ padding: '12px', color: '#6B7280' }}>{new Date(flag.timestamp || flag.created_at).toLocaleTimeString()}</td>
                               <td style={{ padding: '12px', fontWeight: 700, color: '#1F2937' }}>{flag.user_name}</td>
                               <td style={{ padding: '12px' }}>
                                 <span style={{ padding: '4px 8px', borderRadius: '6px', backgroundColor: '#F1F5F9', fontSize: '0.75rem', fontWeight: 600, color: '#374151' }}>
-                                  {flag.flag_type.replace(/_/g, ' ')}
+                                  {String(flag.flag_type || '').replace(/_/g, ' ')}
                                 </span>
                               </td>
                               <td style={{ padding: '12px' }}>
@@ -2329,7 +2456,11 @@ FACE_NOT_FOUND: 0,
             </div>
             
             <div style={{ flex: 1, overflowY: 'auto' }}>
-              <LiveMonitoring examId={activeLiveMonitorExamId} />
+              <LiveMonitoring
+                examId={activeLiveMonitorExamId}
+                liveEvents={liveActivityEvents}
+                connectionStatus={connectionStatus}
+              />
             </div>
           </div>
         </div>
