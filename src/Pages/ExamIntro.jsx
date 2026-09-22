@@ -23,6 +23,7 @@ import defaultAnim from "../assets/default.json";
 import launchAnim from "../assets/launch.json";
 import "../ExamIntro.css";
 import Loader from "../Components/common/Loader";
+import { getDisplayInstructions } from "../utils/examConfig";
 import Navbar from "../Components/common/Navbar";
 
 export default function ExamIntro() {
@@ -78,6 +79,9 @@ export default function ExamIntro() {
 
   const instructorName = exam.instructor_name || 'Dr. Aris Thorne';
   const totalQuestions = exam.questions?.length || 40;
+
+  // Issue #4: never surface the embedded `---CONFIG---` payload to candidates.
+  const displayInstructions = getDisplayInstructions(exam.instructions);
 
   return (
     <div className="exam-page">
@@ -148,8 +152,8 @@ export default function ExamIntro() {
             <div className="overview-card">
               <h2>Assessment Overview</h2>
               <div className="overview-text-content">
-                {exam.instructions ? (
-                  exam.instructions.split('\n').map((para, i) => (
+                {displayInstructions ? (
+                  displayInstructions.split('\n').map((para, i) => (
                     <p key={i}>{para}</p>
                   ))
                 ) : (
